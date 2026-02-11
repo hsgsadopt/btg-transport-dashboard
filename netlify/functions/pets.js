@@ -5,22 +5,55 @@ async function fetchText(url) {
   return await r.text();
 }
 
-function parseOg(html, property) {
-  const re = new RegExp(`<meta[^>]+property=["']${property}["'][^>]+content=["']([^"']+)["']`, "i");
-  return html.match(re)?.[1] || null;
+function extractNextDataJson(html) {
+  const startTag = '<script id="__NEXT_DATA__" type="application/json">';
+  const start = html.indexOf(startTag);
+  if (start === -1) return null;
+  const from = start + startTag.length;
+  const end = html.indexOf("</script>", from);
+  if (end === -1) return null;
+  const jsonText = html.slice(from, end).trim();
+  try { return JSON.parse(jsonText); } catch { return null; }
 }
 
-async function enrichFromPetPage(profileUrl) {
-  const html = await fetchText(profileUrl);
+// Walk any nested JSON and collect “animal-like” objects
+function collectAnimals(obj, out) {
+  if (!obj || typeof obj !== "object") return;
 
-  // These are very stable on Petfinder detail pages
-  const ogTitle = parseOg(html, "og:title");   // e.g., "Coco | Petfinder"
-  const ogImage = parseOg(html, "og:image");   // correct image for that pet
+  // Common Petfinder fields we can key off of
+  const name = obj.name;
+  const species = obj.species;
+  const url = obj.url || obj.seoUrl || obj.detailsUrl || obj.profileUrl;
 
-  const name = ogTitle ? ogTitle.split("|")[0].trim() : "View pet";
-  const photo = ogImage || null;
+  // Photo candidates
+  const photo =
+    obj.primary_photo_cropped?.full ||
+    obj.primaryPhotoCropped?.full ||
+    obj.primary_photo_cropped?.large ||
+    obj.primaryPhotoCropped?.large ||
+    obj.photos?.[0]?.full ||
+    obj.photos?.[0]?.large ||
+    obj.photos?.[0]?.medium ||
+    obj.media?.photos?.[0]?.full ||
+    obj.media?.photos?.[0]?.large ||
+    obj.media?.photos?.[0]?.medium ||
+    null;
 
-  return { name, photo };
+  const looksLikePet =
+    typeof name === "string" &&
+    (species === "Dog" || species === "Cat") &&
+    typeof url === "string" &&
+    (url.startsWith("/dog/") || url.startsWith("/cat/") || url.includes("petfinder.com/"));
+
+  if (looksLikePet) {
+    out.push({ name, species, url, photo });
+  }
+
+  if (Array.isArray(obj)) {
+    for (const v of obj) collectAnimals(v, out);
+  } else {
+    for (const k of Object.keys(obj)) collectAnimals(obj[k], out);
+  }
 }
 
 exports.handler = async function () {
@@ -33,53 +66,33 @@ exports.handler = async function () {
     { id: "GA1063", name: "City of Perry Animal Control", url: "https://www.petfinder.com/member/us/ga/perry/city-of-perry-animal-control-ga1063/" }
   ];
 
-  // Keep this conservative so Netlify doesn't time out
-  const MAX_PETS_PER_SHELTER = 80;
-
   try {
     const updatedAt = new Date().toISOString();
     const resultsByUrl = new Map();
 
     for (const org of orgs) {
       const html = await fetchText(org.url);
+      const nextData = extractNextDataJson(html);
 
-      // Dogs + Cats only
-      const linkRe = /href="(\/(dog|cat)\/[^"]+)"/g;
+      const found = [];
+      if (nextData) {
+        collectAnimals(nextData, found);
+      }
 
-      const seen = new Set();
-      let m;
-
-      while ((m = linkRe.exec(html)) !== null) {
-        const path = m[1];
-        if (seen.has(path)) continue;
-        seen.add(path);
-
-        const profileUrl = "https://www.petfinder.com" + path;
-        const species = path.startsWith("/cat/") ? "Cat" : "Dog";
+      // Dedupe + normalize URLs
+      for (const item of found) {
+        const profileUrl = item.url.startsWith("http")
+          ? item.url
+          : ("https://www.petfinder.com" + item.url);
 
         resultsByUrl.set(profileUrl, {
           shelter_id: org.id,
           shelter_name: org.name,
-          species,
-          profile_url: profileUrl,
-          name: "Loading…",
-          photo: null
+          name: item.name || "View pet",
+          species: item.species || "",
+          photo: item.photo || null,
+          profile_url: profileUrl
         });
-
-        if (seen.size >= MAX_PETS_PER_SHELTER) break;
-      }
-    }
-
-    // Enrich each pet with the *correct* name + photo from its own page.
-    // Do it sequentially to avoid rate limits / timeouts. (Caching on Netlify helps a lot.)
-    for (const [url, pet] of resultsByUrl.entries()) {
-      try {
-        const { name, photo } = await enrichFromPetPage(url);
-        pet.name = name;
-        pet.photo = photo;
-        resultsByUrl.set(url, pet);
-      } catch {
-        // If one pet fails, keep going
       }
     }
 
@@ -104,4 +117,3 @@ exports.handler = async function () {
     };
   }
 };
-

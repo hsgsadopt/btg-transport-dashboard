@@ -1,25 +1,51 @@
-exports.handler = async function (event) {
+// netlify/functions/pets.js
+
+async function fetchText(url) {
+  const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+  return await r.text();
+}
+
+function parseOg(html, property) {
+  const re = new RegExp(`<meta[^>]+property=["']${property}["'][^>]+content=["']([^"']+)["']`, "i");
+  return html.match(re)?.[1] || null;
+}
+
+async function enrichFromPetPage(profileUrl) {
+  const html = await fetchText(profileUrl);
+
+  // These are very stable on Petfinder detail pages
+  const ogTitle = parseOg(html, "og:title");   // e.g., "Coco | Petfinder"
+  const ogImage = parseOg(html, "og:image");   // correct image for that pet
+
+  const name = ogTitle ? ogTitle.split("|")[0].trim() : "View pet";
+  const photo = ogImage || null;
+
+  return { name, photo };
+}
+
+exports.handler = async function () {
   const orgs = [
     { id: "GA99", name: "Macon-Bibb Animal Welfare", url: "https://www.petfinder.com/member/us/ga/macon/macon-bibb-county-animal-welfare-ga99/" },
     { id: "GA529", name: "Bryan County Animal Services", url: "https://www.petfinder.com/member/us/ga/richmond-hill/bryan-county-animal-services-ga529/" },
     { id: "GA168", name: "Friends of Perry Animal Shelter", url: "https://www.petfinder.com/member/us/ga/perry/friends-of-perry-animal-shelter-ga168/" },
     { id: "GA1109", name: "Lyons Animal Control", url: "https://www.petfinder.com/member/us/ga/lyons/lyons-animal-control-ga1109/" },
     { id: "GA947", name: "Waycross Animal Services", url: "https://www.petfinder.com/member/us/ga/waycross/waycross-animal-services-ga947/" },
-    { id: "SC507", name: "Barnwell County Animal Shelter", url: "https://www.petfinder.com/member/us/sc/barnwell/barnwell-county-animal-shelter-sc507/" },
     { id: "GA1063", name: "City of Perry Animal Control", url: "https://www.petfinder.com/member/us/ga/perry/city-of-perry-animal-control-ga1063/" }
   ];
+
+  // Keep this conservative so Netlify doesn't time out
+  const MAX_PETS_PER_SHELTER = 80;
 
   try {
     const updatedAt = new Date().toISOString();
     const resultsByUrl = new Map();
 
     for (const org of orgs) {
-      const html = await fetch(org.url, {
-        headers: { "User-Agent": "Mozilla/5.0" }
-      }).then(r => r.text());
+      const html = await fetchText(org.url);
 
       // Dogs + Cats only
       const linkRe = /href="(\/(dog|cat)\/[^"]+)"/g;
+
       const seen = new Set();
       let m;
 
@@ -29,34 +55,31 @@ exports.handler = async function (event) {
         seen.add(path);
 
         const profileUrl = "https://www.petfinder.com" + path;
-
-        // Grab a window near the link to try to find a name + photo
-        const start = Math.max(0, m.index - 700);
-        const end = Math.min(html.length, m.index + 1600);
-        const chunk = html.slice(start, end);
-
-        const nameMatch =
-          chunk.match(/aria-label="([^"]{1,80})"/) ||
-          chunk.match(/"name":"([^"]{1,80})"/);
-
-        const imgMatch =
-          chunk.match(/src="([^"]+\.(?:jpg|jpeg|png)[^"]*)"/i) ||
-          chunk.match(/"url":"([^"]+\.(?:jpg|jpeg|png)[^"]*)"/i);
-
-        const name = (nameMatch?.[1] || "View pet").trim();
-        const photo = imgMatch?.[1] || null;
         const species = path.startsWith("/cat/") ? "Cat" : "Dog";
 
         resultsByUrl.set(profileUrl, {
           shelter_id: org.id,
           shelter_name: org.name,
-          name,
           species,
-          photo,
-          profile_url: profileUrl
+          profile_url: profileUrl,
+          name: "Loading…",
+          photo: null
         });
 
-        if (seen.size >= 250) break;
+        if (seen.size >= MAX_PETS_PER_SHELTER) break;
+      }
+    }
+
+    // Enrich each pet with the *correct* name + photo from its own page.
+    // Do it sequentially to avoid rate limits / timeouts. (Caching on Netlify helps a lot.)
+    for (const [url, pet] of resultsByUrl.entries()) {
+      try {
+        const { name, photo } = await enrichFromPetPage(url);
+        pet.name = name;
+        pet.photo = photo;
+        resultsByUrl.set(url, pet);
+      } catch {
+        // If one pet fails, keep going
       }
     }
 
@@ -81,3 +104,4 @@ exports.handler = async function (event) {
     };
   }
 };
+

@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/pets.js": {
+      "runtime": "nodejs20.x"
+    }
+  }
+}
